@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Demo Chat</title>
+  <style>
+    body { font-family: system-ui,Segoe UI,Roboto,Arial; max-width:800px;margin:20px auto;padding:0 12px;color:#111 }
+    #messages { border:1px solid #ddd;border-radius:8px;padding:12px;min-height:200px; max-height:60vh; overflow:auto; background:#fafafa }
+    .message { padding:8px 10px; margin:6px 0; border-radius:6px; }
+    .user { background:#dbeafe; align-self:flex-end }
+    .assistant { background:#f1f5f9 }
+    #composer { display:flex; gap:8px; margin-top:12px }
+    textarea { flex:1; min-height:48px; resize:vertical }
+    button { padding:8px 12px }
+    .meta { color:#666; font-size:0.9rem }
+  </style>
+</head>
+<body>
+  <h2>Demo Chat (local)</h2>
+  <div class="meta">This demo proxies calls to your Flask backend which forwards them to Gemini-like API.</div>
+  <div id="messages" aria-live="polite"></div>
+
+  <form id="composer">
+    <textarea id="input" placeholder="Type a message..." required></textarea>
+    <button type="submit">Send</button>
+  </form>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

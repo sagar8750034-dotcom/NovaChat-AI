@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NovaChat AI</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="chat-app">
+    <header class="chat-header">
+      <h1>NovaChat AI</h1>
+      <p>Your Intelligent AI Assistant</p>
+    </header>
+
+    <main class="chat-window" id="chatWindow">
+      <section class="welcome-section" id="welcomeSection" aria-label="Welcome">
+        <p class="welcome-greeting">How can I help you today?</p>
+        <div class="welcome-suggestions">
+          <button type="button" class="suggestion-chip" data-suggestion="Explain Python">Explain Python</button>
+          <button type="button" class="suggestion-chip" data-suggestion="Help me learn coding">Help me learn coding</button>
+          <button type="button" class="suggestion-chip" data-suggestion="Write something">Write something</button>
+          <button type="button" class="suggestion-chip" data-suggestion="Brainstorm an idea">Brainstorm an idea</button>
+        </div>
+      </section>
+    </main>
+
+    <form id="chatForm" class="chat-input-area">
+      <input id="userInput" type="text" placeholder="Type your message..." autocomplete="off" />
+      <button type="button" id="micButton" class="mic-button" aria-label="Voice input" title="Voice input" aria-pressed="false">
+        <svg class="mic-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M12 14a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v4a3 3 0 0 0 3 3Z" fill="currentColor"/>
+          <path d="M17.5 11a1 1 0 1 0-2 0 3.5 3.5 0 1 1-7 0 1 1 0 1 0-2 0 5.5 5.5 0 0 0 4.5 5.41V19H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.59A5.5 5.5 0 0 0 17.5 11Z" fill="currentColor"/>
+        </svg>
+        <span class="mic-listening-dot" aria-hidden="true"></span>
+      </button>
+      <button type="submit" id="sendButton">Send</button>
+      <p id="voiceStatus" class="voice-status" aria-live="polite" hidden></p>
+    </form>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
