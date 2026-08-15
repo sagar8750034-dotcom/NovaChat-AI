@@ -6,3 +6,4 @@ SQLAlchemy>=2.0,<3.0
 psycopg2-binary>=2.9
 alembic>=1.13
 # Optional: use gunicorn or waitress for production WSGI server
+gunicorn>=21.0
