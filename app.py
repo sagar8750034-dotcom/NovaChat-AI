@@ -13,6 +13,9 @@ from flask_cors import CORS
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
+from db import SessionLocal, get_session, ping_database
+from models import Conversation, Message
+
 API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 
@@ -74,12 +77,49 @@ def build_contents(data):
                     "role": gemini_role,
                     "parts": [{"text": str(text)}],
                 })
-        return contents or None
+        if contents:
+            return contents
 
     if data.get("message"):
         return [{"role": "user", "parts": [{"text": str(data["message"])}]}]
 
     return None
+
+
+def persist_chat_turn(conversation_id, user_text, assistant_text):
+    """Save one user+assistant turn to Neon. Raises on failure."""
+    from uuid import UUID
+
+    session = None
+    try:
+        session = get_session()
+        conversation = None
+        if conversation_id:
+            try:
+                conversation = session.get(Conversation, UUID(str(conversation_id)))
+            except (ValueError, TypeError):
+                conversation = None
+        if conversation is None:
+            conversation = Conversation()
+            session.add(conversation)
+            session.flush()
+
+        session.add(Message(conversation_id=conversation.id, role="user", content=user_text))
+        session.add(
+            Message(conversation_id=conversation.id, role="assistant", content=assistant_text)
+        )
+        session.commit()
+        session.refresh(conversation)
+        return str(conversation.id)
+    except Exception:
+        if session is not None:
+            session.rollback()
+        raise
+    finally:
+        if session is not None:
+            session.close()
+        if SessionLocal is not None:
+            SessionLocal.remove()
 
 
 @app.route("/")
@@ -95,6 +135,55 @@ def styles():
 @app.route("/script.js")
 def script():
     return send_from_directory(BASE_DIR, "script.js")
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    db_ok, db_detail = ping_database()
+    status = 200 if db_ok else 503
+    return jsonify({
+        "ok": db_ok,
+        "service": "NovaChat AI",
+        "database": "connected" if db_ok else "unavailable",
+        "detail": db_detail,
+    }), status
+
+
+@app.route("/api/conversations/<conversation_id>/messages", methods=["GET"])
+def list_conversation_messages(conversation_id):
+    from uuid import UUID
+
+    db_ok, db_detail = ping_database()
+    if not db_ok:
+        return jsonify({"error": db_detail}), 503
+
+    try:
+        conv_uuid = UUID(str(conversation_id))
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid conversation id."}), 400
+
+    session = get_session()
+    try:
+        conversation = session.get(Conversation, conv_uuid)
+        if conversation is None:
+            return jsonify({"error": "Conversation not found."}), 404
+        messages = [
+            {
+                "id": str(msg.id),
+                "role": msg.role,
+                "content": msg.content,
+                "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            }
+            for msg in conversation.messages
+        ]
+        return jsonify({
+            "conversation_id": str(conversation.id),
+            "messages": messages,
+        })
+    finally:
+        session.close()
+        if SessionLocal is not None:
+            SessionLocal.remove()
 
 
 @app.route("/api/chat", methods=["GET"])
@@ -181,7 +270,25 @@ def chat():
     if not text:
         return jsonify({"error": "Gemini returned an empty response. Please try again."}), 502
 
-    return jsonify({"reply": text})
+    payload_out = {"reply": text}
+
+    last_user = ""
+    for item in reversed(contents):
+        if item.get("role") == "user":
+            parts = item.get("parts") or []
+            last_user = (parts[0] or {}).get("text", "") if parts else ""
+            break
+
+    if last_user:
+        try:
+            saved_id = persist_chat_turn(data.get("conversation_id"), last_user, text)
+            payload_out["conversation_id"] = saved_id
+        except RuntimeError as exc:
+            app.logger.warning("Chat persist skipped: %s", exc)
+        except Exception as exc:
+            app.logger.exception("Chat persist failed: %s", exc)
+
+    return jsonify(payload_out)
 
 
 if __name__ == "__main__":

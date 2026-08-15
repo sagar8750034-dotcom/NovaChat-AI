@@ -2,4 +2,7 @@ flask>=2.0
 requests>=2.25
 python-dotenv>=0.15
 flask-cors>=3.0
+SQLAlchemy>=2.0,<3.0
+psycopg2-binary>=2.9
+alembic>=1.13
 # Optional: use gunicorn or waitress for production WSGI server

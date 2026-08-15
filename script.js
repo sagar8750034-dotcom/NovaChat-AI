@@ -1,13 +1,15 @@
 const chatForm = document.getElementById('chatForm');
 const userInput = document.getElementById('userInput');
 const chatWindow = document.getElementById('chatWindow');
-const sendButton = document.getElementById('sendButton');
+const sendButton = document.getElementById('sendButton')
+  || chatForm.querySelector('button[type="submit"]');
 const micButton = document.getElementById('micButton');
 const voiceStatus = document.getElementById('voiceStatus');
 const welcomeSection = document.getElementById('welcomeSection');
 
 // In-memory session history (clears on page refresh / new session)
 const conversationHistory = [];
+let conversationId = null;
 
 const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
 const speechSupported = Boolean(SpeechRecognitionAPI);
@@ -197,8 +199,8 @@ function hideTypingIndicator() {
 
 function setLoading(isLoading) {
   isSending = isLoading;
-  sendButton.disabled = isLoading;
-  userInput.disabled = isLoading;
+  if (sendButton) sendButton.disabled = isLoading;
+  if (userInput) userInput.disabled = isLoading;
   if (micButton) {
     micButton.disabled = isLoading || !speechSupported;
   }
@@ -332,10 +334,15 @@ function setupVoiceControls() {
 }
 
 async function fetchGeminiResponse(messages) {
+  const body = { messages };
+  if (conversationId) {
+    body.conversation_id = conversationId;
+  }
+
   const response = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify(body),
   });
 
   let data = {};
@@ -351,6 +358,10 @@ async function fetchGeminiResponse(messages) {
 
   if (!data.reply) {
     throw new Error('Gemini se response nahi mila.');
+  }
+
+  if (data.conversation_id) {
+    conversationId = data.conversation_id;
   }
 
   return data.reply;
