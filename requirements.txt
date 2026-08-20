@@ -7,3 +7,6 @@ psycopg2-binary>=2.9
 alembic>=1.13
 # Optional: use gunicorn or waitress for production WSGI server
 gunicorn>=21.0
+flasgger>=0.9.7
+google-auth>=2.29
+Authlib>=1.3

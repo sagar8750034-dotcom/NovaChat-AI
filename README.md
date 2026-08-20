@@ -24,6 +24,11 @@ A Flask chat app with a Gemini-powered backend, an HTML/CSS/JS frontend, and Neo
    GEMINI_API_KEY=your_gemini_api_key_here
    GEMINI_MODEL=gemini-flash-lite-latest
    DATABASE_URL=postgresql://USER:PASSWORD@HOST/dbname?sslmode=require
+   SECRET_KEY=change-this-to-a-long-random-string
+   GOOGLE_CLIENT_ID=your_google_client_id
+   GOOGLE_CLIENT_SECRET=your_google_client_secret
+   GOOGLE_REDIRECT_URI=http://127.0.0.1:5002/auth/google/callback
+   TTS_API_KEY=your_tts_api_key_here
    ```
 
 3. Install dependencies:
@@ -32,7 +37,7 @@ A Flask chat app with a Gemini-powered backend, an HTML/CSS/JS frontend, and Neo
    pip install -r requirements.txt
    ```
 
-4. Apply database migrations (creates `conversations` and `messages` tables):
+4. Apply database migrations (creates `users`, `conversations`, and `messages` tables, and adds conversation ownership):
 
    ```powershell
    alembic upgrade head
@@ -55,6 +60,24 @@ A Flask chat app with a Gemini-powered backend, an HTML/CSS/JS frontend, and Neo
    You should see `"database": "connected"`.
 
 Do not open `index.html` as a file. The chat UI must run through the Flask server so messages can reach Gemini.
+
+You can sign in with email and password, or with Google. Accounts that share the same verified email are linked, so history stays in one place.
+
+## Google sign-in
+
+1. In [Google Cloud Console](https://console.cloud.google.com/) create (or select) a project.
+2. Configure the OAuth consent screen (External is fine for testing).
+3. Create credentials → **OAuth client ID** → **Web application**.
+4. Add authorized JavaScript origins and redirect URIs:
+
+   - Local origin: `http://127.0.0.1:5002`
+   - Local redirect: `http://127.0.0.1:5002/auth/google/callback`
+   - Render origin: `https://YOUR-SERVICE.onrender.com`
+   - Render redirect: `https://YOUR-SERVICE.onrender.com/auth/google/callback`
+
+5. Copy the client ID and secret into `.env`. `GOOGLE_REDIRECT_URI` must match one of the redirect URIs exactly.
+
+6. Run `alembic upgrade head` if you have not applied the Google identity migration yet.
 
 ## Stop the server
 
