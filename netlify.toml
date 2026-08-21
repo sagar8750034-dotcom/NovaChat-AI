@@ -1,0 +1,11 @@
+# NovaChat AI — static frontend for Netlify
+# Active UI files: index.html, styles.css, script.js, config.js
+# Flask/Python backend stays on Render; do not put secrets here.
+
+[build]
+  publish = "."
+  # Writes config.js from Netlify env BACKEND_URL (public Render API origin only).
+  command = "node -e \"const fs=require('fs'); const u=(process.env.BACKEND_URL||'').trim().replace(/\\/+$/,''); fs.writeFileSync('config.js', 'window.NOVACHAT_API_BASE_URL = ' + JSON.stringify(u) + ';\\n');\""
+
+# SPA-style fallback is NOT used — this is a single index.html app.
+# Do not add /* → /index.html redirects that could mask missing assets.

@@ -247,7 +247,20 @@ def google_profile_from_userinfo(info):
 
 
 def oauth_error_redirect(message):
-    return redirect("/?" + urlencode({"auth_error": message}))
+    return frontend_redirect("/?" + urlencode({"auth_error": message}))
+
+
+def frontend_redirect(path="/"):
+    """
+    After Google OAuth, send the browser back to the SPA origin.
+    When FRONTEND_ORIGIN is set (Netlify), use that; otherwise same-origin "/".
+    """
+    origin = (os.getenv("FRONTEND_ORIGIN") or "").strip().rstrip("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    if origin:
+        return redirect(origin + path)
+    return redirect(path)
 
 
 def upsert_google_user(db_session, profile):

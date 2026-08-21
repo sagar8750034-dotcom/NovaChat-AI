@@ -10,6 +10,25 @@ const voiceStatus = document.getElementById('voiceStatus');
 const welcomeSection = document.getElementById('welcomeSection');
 const VOICE_LANG_STORAGE_KEY = 'novachat-voice-lang';
 
+/*
+  Backend base URL for split Netlify (frontend) + Render (API) deploys.
+  - Local Flask same-origin: leave empty (set in config.js as "").
+  - Netlify: set window.NOVACHAT_API_BASE_URL / config.js to the Render URL.
+  Never put API keys or secrets here.
+*/
+function resolveApiBaseUrl() {
+  const raw = (typeof window !== 'undefined' && window.NOVACHAT_API_BASE_URL != null)
+    ? String(window.NOVACHAT_API_BASE_URL).trim()
+    : '';
+  return raw.replace(/\/+$/, '');
+}
+const API_BASE_URL = resolveApiBaseUrl();
+
+function apiUrl(path) {
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return API_BASE_URL ? `${API_BASE_URL}${normalized}` : normalized;
+}
+
 // In-memory session history (clears on page refresh / new session)
 const conversationHistory = [];
 let conversationId = null;
@@ -1257,8 +1276,9 @@ const conversationList = document.getElementById('conversationList');
 const historyStatus = document.getElementById('historyStatus');
 const sidebarOverlay = document.getElementById('sidebarOverlay');
 
-async function apiFetch(url, options = {}) {
-  const response = await fetch(url, Object.assign({ credentials: 'same-origin' }, options));
+async function apiFetch(path, options = {}) {
+  const url = apiUrl(path);
+  const response = await fetch(url, Object.assign({ credentials: 'include' }, options));
   if (response.status === 401 && appReady) {
     handleSessionExpired();
   }
@@ -1435,9 +1455,9 @@ async function submitAuthForm(url, payload, submitButton) {
   setAuthError('');
   if (submitButton) submitButton.disabled = true;
   try {
-    const response = await fetch(url, {
+    const response = await fetch(apiUrl(url), {
       method: 'POST',
-      credentials: 'same-origin',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
@@ -1457,6 +1477,10 @@ async function submitAuthForm(url, payload, submitButton) {
 
 function setupAuthUi() {
   setupPasswordToggles();
+  const googleLoginButton = document.getElementById('googleLoginButton');
+  if (googleLoginButton) {
+    googleLoginButton.setAttribute('href', apiUrl('/auth/google'));
+  }
   const params = new URLSearchParams(window.location.search);
   const authErrorParam = params.get('auth_error');
   if (authErrorParam) {
@@ -1543,7 +1567,7 @@ async function enterAuthenticatedApp() {
 
 async function bootApp() {
   try {
-    const response = await fetch('/api/auth/me', { credentials: 'same-origin' });
+    const response = await fetch(apiUrl('/api/auth/me'), { credentials: 'include' });
     const data = await response.json().catch(() => ({}));
     if (data.authenticated && data.user) {
       applyCurrentUser(data.user);

@@ -79,6 +79,19 @@ You can sign in with email and password, or with Google. Accounts that share the
 
 6. Run `alembic upgrade head` if you have not applied the Google identity migration yet.
 
+### Split hosting (Netlify frontend + Render API)
+
+If the UI is on Netlify and the API stays on Render:
+
+1. Netlify env `BACKEND_URL` = your Render origin (e.g. `https://YOUR-SERVICE.onrender.com`) — public URL only, no secrets.
+2. Render env:
+   - `FRONTEND_ORIGIN` = your Netlify origin (e.g. `https://YOUR-SITE.netlify.app`)
+   - `CORS_ORIGINS` = same Netlify origin (comma-separated if you have preview URLs too)
+   - `SESSION_COOKIE_SAMESITE=None`
+   - `SESSION_COOKIE_SECURE=true`
+   - `GOOGLE_REDIRECT_URI` remains the **Render** callback: `https://YOUR-SERVICE.onrender.com/auth/google/callback`
+3. In Google Cloud Console also add the Netlify origin under **Authorized JavaScript origins**.
+
 ## Stop the server
 
 In the terminal running `python app.py`, press `Ctrl + C`.

@@ -50,6 +50,7 @@ from auth import (
     validate_login,
     validate_signup,
     verify_password,
+    frontend_redirect,
 )
 from db import SessionLocal, get_session, ping_database
 from models import Conversation, Message, User, utcnow
@@ -81,7 +82,30 @@ SYSTEM_INSTRUCTION = (
 
 app = Flask(__name__, static_folder=None)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-CORS(app)
+
+# Cross-origin frontend (Netlify) → API (Render). Comma-separated origins only.
+# Example: CORS_ORIGINS=https://your-site.netlify.app,http://127.0.0.1:5500
+_cors_origins = [
+    origin.strip().rstrip("/")
+    for origin in (os.getenv("CORS_ORIGINS") or "").split(",")
+    if origin.strip()
+]
+_frontend_origin = (os.getenv("FRONTEND_ORIGIN") or "").strip().rstrip("/")
+if _frontend_origin and _frontend_origin not in _cors_origins:
+    _cors_origins.append(_frontend_origin)
+
+if _cors_origins:
+    CORS(
+        app,
+        resources={
+            r"/api/*": {"origins": _cors_origins},
+            r"/auth/*": {"origins": _cors_origins},
+        },
+        supports_credentials=True,
+    )
+else:
+    # Same-origin / local monolith (Flask serves the UI).
+    CORS(app)
 
 _secret = (os.getenv("SECRET_KEY") or "").strip()
 if not _secret:
@@ -91,11 +115,26 @@ if not _secret:
     )
     _secret = os.urandom(32)
 app.secret_key = _secret
+
+# Cookie settings for Netlify (HTTPS) + Render (HTTPS) split hosting:
+# SameSite=None + Secure are required for cross-site credentialed fetches.
+_same_site = (os.getenv("SESSION_COOKIE_SAMESITE") or "").strip() or (
+    "None" if _frontend_origin else "Lax"
+)
+_cookie_secure_env = os.getenv("SESSION_COOKIE_SECURE", "").strip().lower()
+if _cookie_secure_env in ("1", "true", "yes"):
+    _cookie_secure = True
+elif _cookie_secure_env in ("0", "false", "no"):
+    _cookie_secure = False
+else:
+    # Default Secure when cross-origin frontend is configured (browsers require it with SameSite=None).
+    _cookie_secure = _same_site.lower() == "none" or bool(_frontend_origin)
+
 app.config.update(
     SESSION_COOKIE_NAME="novachat_session",
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes"),
+    SESSION_COOKIE_SAMESITE=_same_site,
+    SESSION_COOKIE_SECURE=_cookie_secure,
     PERMANENT_SESSION_LIFETIME=timedelta(days=14),
 )
 
@@ -642,6 +681,11 @@ def script():
     return send_from_directory(BASE_DIR, "script.js")
 
 
+@app.route("/config.js")
+def config_js():
+    return send_from_directory(BASE_DIR, "config.js")
+
+
 def _db_unavailable():
     return jsonify({"error": "Database unavailable. Please try again shortly."}), 503
 
@@ -990,7 +1034,7 @@ def google_login_callback():
             "Google OAuth login succeeded for local user id=%s",
             str(user.id),
         )
-        return redirect("/")
+        return frontend_redirect("/")
     except ValueError as exc:
         app.logger.warning("Google OAuth profile validation failed: %s", str(exc))
         return oauth_error_redirect(str(exc))
