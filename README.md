@@ -83,7 +83,8 @@ You can sign in with email and password, or with Google. Accounts that share the
 
 If the UI is on Netlify and the API stays on Render:
 
-1. Netlify env `BACKEND_URL` = your Render origin (e.g. `https://YOUR-SERVICE.onrender.com`) — public URL only, no secrets.
+1. Netlify env `API_BASE_URL` = your Render origin (e.g. `https://YOUR-SERVICE.onrender.com`) — public URL only, no secrets.
+   (`BACKEND_URL` is still accepted as a fallback name.)
 2. Render env:
    - `FRONTEND_ORIGIN` = your Netlify origin (e.g. `https://YOUR-SITE.netlify.app`)
    - `CORS_ORIGINS` = same Netlify origin (comma-separated if you have preview URLs too)

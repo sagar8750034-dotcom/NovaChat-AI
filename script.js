@@ -12,22 +12,59 @@ const VOICE_LANG_STORAGE_KEY = 'novachat-voice-lang';
 
 /*
   Backend base URL for split Netlify (frontend) + Render (API) deploys.
-  - Local Flask same-origin: leave empty (set in config.js as "").
-  - Netlify: set window.NOVACHAT_API_BASE_URL / config.js to the Render URL.
+  - Local Flask same-origin: empty config → relative URLs (including /auth/google).
+  - Netlify production: always use the Render backend (never Netlify /auth/google).
   Never put API keys or secrets here.
 */
+const PRODUCTION_API_BASE_URL = 'https://novachat-ai.onrender.com';
+
 function resolveApiBaseUrl() {
-  const raw = (typeof window !== 'undefined' && window.NOVACHAT_API_BASE_URL != null)
-    ? String(window.NOVACHAT_API_BASE_URL).trim()
-    : '';
-  return raw.replace(/\/+$/, '');
+  const candidates = [
+    typeof window !== 'undefined' ? window.NOVACHAT_API_BASE_URL : '',
+    typeof window !== 'undefined' ? window.API_BASE_URL : '',
+  ];
+  for (let i = 0; i < candidates.length; i += 1) {
+    const raw = candidates[i] == null ? '' : String(candidates[i]).trim();
+    if (raw) return raw.replace(/\/+$/, '');
+  }
+
+  // Netlify hosts must never call same-origin /auth/google (404).
+  const host = (typeof window !== 'undefined' && window.location && window.location.hostname) || '';
+  if (
+    host === 'novachat-ai-chatbot.netlify.app'
+    || host.endsWith('.netlify.app')
+    || host.endsWith('.netlify.live')
+  ) {
+    return PRODUCTION_API_BASE_URL;
+  }
+  return '';
 }
 const API_BASE_URL = resolveApiBaseUrl();
 
 function apiUrl(path) {
   const normalized = path.startsWith('/') ? path : `/${path}`;
-  return API_BASE_URL ? `${API_BASE_URL}${normalized}` : normalized;
+  if (!API_BASE_URL) return normalized;
+  return `${API_BASE_URL.replace(/\/+$/, '')}${normalized}`;
 }
+
+function googleOAuthStartUrl() {
+  return apiUrl('/auth/google');
+}
+
+function bindGoogleLoginHref() {
+  const googleLoginButton = document.getElementById('googleLoginButton');
+  if (!googleLoginButton) return;
+  const oauthUrl = googleOAuthStartUrl();
+  googleLoginButton.setAttribute('href', oauthUrl);
+  // Hard guarantee: never navigate to Netlify /auth/google
+  googleLoginButton.addEventListener('click', (event) => {
+    event.preventDefault();
+    window.location.assign(oauthUrl);
+  });
+}
+
+// config.js loads before this file; bind immediately (scripts are at end of body).
+bindGoogleLoginHref();
 
 // In-memory session history (clears on page refresh / new session)
 const conversationHistory = [];
@@ -1479,7 +1516,7 @@ function setupAuthUi() {
   setupPasswordToggles();
   const googleLoginButton = document.getElementById('googleLoginButton');
   if (googleLoginButton) {
-    googleLoginButton.setAttribute('href', apiUrl('/auth/google'));
+    googleLoginButton.setAttribute('href', googleOAuthStartUrl());
   }
   const params = new URLSearchParams(window.location.search);
   const authErrorParam = params.get('auth_error');

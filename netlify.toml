@@ -4,8 +4,8 @@
 
 [build]
   publish = "."
-  # Writes config.js from Netlify env BACKEND_URL (public Render API origin only).
-  command = "node -e \"const fs=require('fs'); const u=(process.env.BACKEND_URL||'').trim().replace(/\\/+$/,''); fs.writeFileSync('config.js', 'window.NOVACHAT_API_BASE_URL = ' + JSON.stringify(u) + ';\\n');\""
+  # Writes config.js from NOVACHAT_API_BASE_URL or API_BASE_URL (public Render origin only).
+  command = "node -e \"const fs=require('fs'); const u=(process.env.NOVACHAT_API_BASE_URL||process.env.API_BASE_URL||process.env.BACKEND_URL||'https://novachat-ai.onrender.com').trim().replace(/\\/+$/,''); fs.writeFileSync('config.js', 'window.NOVACHAT_API_BASE_URL = ' + JSON.stringify(u) + ';\\nwindow.API_BASE_URL = window.NOVACHAT_API_BASE_URL;\\n');\""
 
 # SPA-style fallback is NOT used — this is a single index.html app.
 # Do not add /* → /index.html redirects that could mask missing assets.
