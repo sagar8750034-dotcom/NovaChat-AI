@@ -593,6 +593,8 @@ def iter_gemini_sse(contents, timing_started=None):
                 yield ("error", _gemini_http_error_message(resp.status_code, upstream))
                 return
 
+            # Force UTF-8 so emoji/multibyte text is not decoded as Latin-1.
+            resp.encoding = "utf-8"
             for raw_line in resp.iter_lines(decode_unicode=True):
                 if raw_line is None:
                     continue
