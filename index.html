@@ -157,25 +157,60 @@
       </main>
 
       <form id="chatForm" class="chat-input-area">
-        <textarea id="userInput" rows="1" placeholder="Type your message..." autocomplete="off"></textarea>
-        <div class="voice-input-controls">
-          <label class="voice-lang-wrap" for="voiceLangSelect">
-            <span class="visually-hidden">Voice input language</span>
-            <select id="voiceLangSelect" class="voice-lang-select" aria-label="Voice input language">
-              <option value="en">English</option>
-              <option value="hi">हिंदी</option>
-            </select>
-          </label>
-          <button type="button" id="micButton" class="mic-button" aria-label="Voice input" title="Voice input" aria-pressed="false">
-            <svg class="mic-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-              <path d="M12 14a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v4a3 3 0 0 0 3 3Z" fill="currentColor"/>
-              <path d="M17.5 11a1 1 0 1 0-2 0 3.5 3.5 0 1 1-7 0 1 1 0 1 0-2 0 5.5 5.5 0 0 0 4.5 5.41V19H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.59A5.5 5.5 0 0 0 17.5 11Z" fill="currentColor"/>
-            </svg>
-            <span class="mic-listening-dot" aria-hidden="true"></span>
-          </button>
+        <div id="attachmentPreview" class="attachment-preview" hidden aria-live="polite"></div>
+        <div class="composer-controls">
+          <div class="attach-wrap">
+            <button
+              type="button"
+              id="attachButton"
+              class="attach-button"
+              aria-label="Add attachment"
+              title="Add photos &amp; files"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              aria-controls="attachMenu"
+            >
+              <span class="attach-button-icon" aria-hidden="true">+</span>
+            </button>
+            <div id="attachMenu" class="attach-menu" role="menu" hidden aria-label="Attachment options">
+              <button type="button" class="attach-menu-item" data-attach-action="files" role="menuitem">
+                <span class="attach-menu-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="18" height="18" focusable="false">
+                    <path fill="currentColor" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zm0 2.5L17.5 8H14zM8 13h8v2H8zm0 4h5v2H8z"/>
+                  </svg>
+                </span>
+                <span>Add photos &amp; files</span>
+              </button>
+            </div>
+            <input
+              type="file"
+              id="attachFileInput"
+              class="attach-file-input"
+              hidden
+              multiple
+              accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.doc,.docx,.csv,.json,.py,.js,.html,.css,.md,image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/csv,application/json,text/markdown"
+            />
+          </div>
+          <textarea id="userInput" rows="1" placeholder="Type your message..." autocomplete="off"></textarea>
+          <div class="voice-input-controls">
+            <label class="voice-lang-wrap" for="voiceLangSelect">
+              <span class="visually-hidden">Voice input language</span>
+              <select id="voiceLangSelect" class="voice-lang-select" aria-label="Voice input language">
+                <option value="en">English</option>
+                <option value="hi">हिंदी</option>
+              </select>
+            </label>
+            <button type="button" id="micButton" class="mic-button" aria-label="Voice input" title="Voice input" aria-pressed="false">
+              <svg class="mic-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M12 14a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v4a3 3 0 0 0 3 3Z" fill="currentColor"/>
+                <path d="M17.5 11a1 1 0 1 0-2 0 3.5 3.5 0 1 1-7 0 1 1 0 1 0-2 0 5.5 5.5 0 0 0 4.5 5.41V19H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.59A5.5 5.5 0 0 0 17.5 11Z" fill="currentColor"/>
+              </svg>
+              <span class="mic-listening-dot" aria-hidden="true"></span>
+            </button>
+          </div>
+          <button type="submit" id="sendButton">Send</button>
+          <button type="button" id="cancelEditButton" class="cancel-edit-button" hidden>Cancel</button>
         </div>
-        <button type="submit" id="sendButton">Send</button>
-        <button type="button" id="cancelEditButton" class="cancel-edit-button" hidden>Cancel</button>
         <p id="voiceStatus" class="voice-status" aria-live="polite" hidden></p>
       </form>
     </div>

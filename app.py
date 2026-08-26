@@ -3,8 +3,11 @@ Flask backend for the Chatbox UI.
 - Serves the existing index.html / styles.css / script.js
 - Proxies chat to Google Gemini (API key stays server-side)
 """
+import base64
 import json
 import os
+import random
+import re
 import time
 from datetime import timedelta
 from uuid import UUID
@@ -26,8 +29,10 @@ from flask import (
 from flask_cors import CORS
 from flasgger import Swagger
 from sqlalchemy import case, or_, func, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.utils import secure_filename
+import uuid as uuid_mod
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Load project .env first and override stale process env so GOOGLE_REDIRECT_URI
@@ -57,11 +62,50 @@ from models import Conversation, Message, User, utcnow
 from tts import TtsConfigError, TtsError, synthesize_speech, tts_configured
 
 MESSAGE_MAX_CHARS = 8000
+ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+ATTACHMENT_MAX_FILES = 8
+ATTACHMENT_UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+ATTACHMENT_ALLOWED_EXTENSIONS = frozenset({
+    "png", "jpg", "jpeg", "webp", "gif",
+    "pdf", "txt", "doc", "docx", "csv", "json",
+    "py", "js", "html", "css", "md",
+})
+ATTACHMENT_IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "webp", "gif"})
+ATTACHMENT_TEXT_EXTENSIONS = frozenset({
+    "txt", "md", "csv", "json", "py", "js", "html", "css",
+})
+ATTACHMENT_MIME_BY_EXT = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "gif": "image/gif",
+    "pdf": "application/pdf",
+    "txt": "text/plain",
+    "md": "text/markdown",
+    "csv": "text/csv",
+    "json": "application/json",
+    "py": "text/x-python",
+    "js": "text/javascript",
+    "html": "text/html",
+    "css": "text/css",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+ATTACHMENT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+# Separate model for text-to-image only — never replaces GEMINI_MODEL chat.
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
+# Temporary kill-switch for text-to-image. Set IMAGE_GENERATION_ENABLED=true to re-enable.
+# Does not remove the endpoint or GEMINI_IMAGE_MODEL; chat/PDF/image understanding stay on.
+IMAGE_GENERATION_ENABLED = os.getenv(
+    "IMAGE_GENERATION_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+IMAGE_PROMPT_MAX_CHARS = 1500
 
-# Friendly NovaChat personality + concise replies
+# Friendly NovaChat personality + adaptive reply length
 SYSTEM_INSTRUCTION = (
     "You are NovaChat AI — a friendly, natural, and conversational companion. "
     "Be approachable and talk like a real person in chat, using simple natural language. "
@@ -71,8 +115,13 @@ SYSTEM_INSTRUCTION = (
     "For serious or technical questions, stay clear, respectful, and helpful, "
     "but still conversational — not stiff. "
     "Use conversation history to understand follow-ups and references like 'it' or 'that'. "
-    "Keep normal responses concise: usually 1-3 short paragraphs, "
-    "or at most 3-5 bullet points only when bullets truly help. "
+    "Follow the user's requested level of detail: keep simple questions concise "
+    "(usually 1-3 short paragraphs, or at most 3-5 bullet points only when bullets truly help). "
+    "When the user asks for a short summary, keep it short. "
+    "When the user asks for a detailed explanation, complete analysis, or section-by-section coverage, "
+    "provide a sufficiently detailed answer and do not stop early. "
+    "For document or PDF summaries, cover the important content rather than cutting off mid-section. "
+    "Do not artificially make every answer long. "
     "Don't use unnecessary headings or bullet points for simple questions. "
     "Use emojis occasionally when they fit naturally, but don't overuse them. "
     "Don't repeatedly say phrases like 'How may I assist you today?' "
@@ -300,6 +349,186 @@ def build_contents(data):
     return None
 
 
+def _owner_upload_dir(owner_id):
+    """Per-user upload directory under the controlled uploads root."""
+    return os.path.join(ATTACHMENT_UPLOAD_DIR, str(owner_id))
+
+
+def _attachment_extension(filename):
+    name = (filename or "").rsplit(".", 1)
+    if len(name) != 2:
+        return ""
+    return name[1].strip().lower()
+
+
+def _normalize_attachment_ids(raw_ids):
+    if raw_ids is None:
+        return []
+    if not isinstance(raw_ids, list):
+        raise ValueError("attachment_ids must be a list.")
+    if len(raw_ids) > ATTACHMENT_MAX_FILES:
+        raise ValueError(
+            f"You can use at most {ATTACHMENT_MAX_FILES} attachments per message."
+        )
+    normalized = []
+    seen = set()
+    for item in raw_ids:
+        aid = str(item or "").strip().lower()
+        if not aid:
+            continue
+        if not ATTACHMENT_ID_RE.fullmatch(aid):
+            raise ValueError("Invalid attachment id.")
+        if aid in seen:
+            continue
+        seen.add(aid)
+        normalized.append(aid)
+    return normalized
+
+
+def _resolve_owned_attachment(owner_id, attachment_id):
+    """
+    Resolve an attachment id to a file under the current user's upload folder.
+    Never trusts client-supplied paths.
+    """
+    if owner_id is None:
+        raise PermissionError("Not authenticated.")
+    if not ATTACHMENT_ID_RE.fullmatch(str(attachment_id or "")):
+        raise ValueError("Invalid attachment id.")
+
+    owner_dir = os.path.realpath(_owner_upload_dir(owner_id))
+    root_dir = os.path.realpath(ATTACHMENT_UPLOAD_DIR)
+    if not owner_dir.startswith(root_dir + os.sep) and owner_dir != root_dir:
+        raise PermissionError("Attachment access denied.")
+    if not os.path.isdir(owner_dir):
+        raise LookupError("Attachment not found.")
+
+    prefix = f"{attachment_id}_"
+    matches = [
+        name for name in os.listdir(owner_dir)
+        if name.startswith(prefix) and os.path.isfile(os.path.join(owner_dir, name))
+    ]
+    if not matches:
+        raise LookupError("Attachment not found.")
+    if len(matches) > 1:
+        raise LookupError("Attachment not found.")
+
+    path = os.path.realpath(os.path.join(owner_dir, matches[0]))
+    if not path.startswith(owner_dir + os.sep):
+        raise PermissionError("Attachment access denied.")
+    if not os.path.isfile(path):
+        raise LookupError("Attachment not found.")
+    return path, matches[0]
+
+
+def _gemini_part_from_owned_file(path, stored_name):
+    """Build one Gemini part from a stored file. Does not execute file contents."""
+    ext = _attachment_extension(stored_name)
+    display_name = stored_name.split("_", 1)[-1] if "_" in stored_name else stored_name
+
+    if ext in ("doc", "docx"):
+        raise ValueError(
+            f'"{display_name}" was uploaded, but DOC/DOCX analysis is not supported yet. '
+            "Please convert it to PDF or TXT and try again."
+        )
+
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise ValueError("Could not read that attachment.") from exc
+    if size <= 0:
+        raise ValueError(f'"{display_name}" is empty.')
+    if size > ATTACHMENT_MAX_BYTES:
+        raise ValueError(f'"{display_name}" is too large to analyze.')
+
+    if ext in ATTACHMENT_IMAGE_EXTENSIONS or ext == "pdf":
+        mime = ATTACHMENT_MIME_BY_EXT.get(ext)
+        if not mime:
+            raise ValueError(f'Unsupported file type for "{display_name}".')
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+        except OSError as exc:
+            raise ValueError("Could not read that attachment.") from exc
+        return {
+            "inline_data": {
+                "mime_type": mime,
+                "data": base64.b64encode(raw).decode("ascii"),
+            }
+        }
+
+    if ext in ATTACHMENT_TEXT_EXTENSIONS:
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+        except OSError as exc:
+            raise ValueError("Could not read that attachment.") from exc
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f'Could not read "{display_name}" as text. '
+                "Save it as UTF-8 and try again."
+            ) from exc
+        return {
+            "text": f"Contents of {display_name}:\n\n{text}"
+        }
+
+    raise ValueError(
+        f'"{display_name}" cannot be analyzed by NovaChat yet.'
+    )
+
+
+def apply_current_turn_attachments(contents, attachment_ids, owner_id):
+    """
+    Append multimodal/text parts for the current user turn only.
+    Returns (contents, None) or (None, (response, status)).
+    """
+    try:
+        ids = _normalize_attachment_ids(attachment_ids)
+    except ValueError as exc:
+        return None, (jsonify({"error": str(exc)}), 400)
+
+    if not ids:
+        return contents, None
+
+    last_user_idx = None
+    for idx in range(len(contents) - 1, -1, -1):
+        if contents[idx].get("role") == "user":
+            last_user_idx = idx
+            break
+    if last_user_idx is None:
+        return None, (jsonify({
+            "error": "Attachments require a user message."
+        }), 400)
+
+    extra_parts = []
+    for attachment_id in ids:
+        try:
+            path, stored_name = _resolve_owned_attachment(owner_id, attachment_id)
+            extra_parts.append(_gemini_part_from_owned_file(path, stored_name))
+        except LookupError:
+            return None, (jsonify({"error": "Attachment not found."}), 404)
+        except PermissionError:
+            return None, (jsonify({
+                "error": "You do not have access to that attachment."
+            }), 403)
+        except ValueError as exc:
+            return None, (jsonify({"error": str(exc)}), 400)
+        except Exception:
+            app.logger.exception("Attachment resolve failed")
+            return None, (jsonify({
+                "error": "Could not process one of the attachments."
+            }), 500)
+
+    parts = list(contents[last_user_idx].get("parts") or [])
+    parts.extend(extra_parts)
+    contents[last_user_idx] = {
+        **contents[last_user_idx],
+        "parts": parts,
+    }
+    return contents, None
+
+
 def _ordered_messages(session, conversation_id):
     """Stable chronological order; user before assistant when timestamps match."""
     return (
@@ -483,9 +712,34 @@ def _gemini_payload(contents):
         },
         "generationConfig": {
             "temperature": 0.3,
-            "maxOutputTokens": 140,
+            # Ceiling only — Gemini still chooses shorter answers for simple asks.
+            "maxOutputTokens": 4096,
         },
     }
+
+
+# Transient Gemini failures only — never retry auth/validation/safety errors.
+GEMINI_MAX_ATTEMPTS = 3
+GEMINI_RETRY_STATUS_CODES = frozenset({429, 500, 503})
+
+
+def _gemini_is_retryable_status(status_code):
+    try:
+        return int(status_code) in GEMINI_RETRY_STATUS_CODES
+    except (TypeError, ValueError):
+        return False
+
+
+def _gemini_retry_sleep(failed_attempt):
+    """Backoff after a failed attempt: ~1s then ~2s, plus small jitter."""
+    base = 1.0 * (2 ** max(0, int(failed_attempt) - 1))
+    time.sleep(base + random.uniform(0.0, 0.25))
+
+
+def _gemini_log_retry(next_attempt, reason):
+    line = f"gemini_retry attempt={next_attempt} reason={reason}"
+    print(line, flush=True)
+    app.logger.info(line)
 
 
 def _gemini_http_error_message(status_code, upstream):
@@ -496,12 +750,24 @@ def _gemini_http_error_message(status_code, upstream):
     )
     friendly = message or f"Gemini request failed (HTTP {status_code})."
     lower = friendly.lower()
-    if "quota" in lower or "rate limit" in lower or status_code == 429:
+
+    if status_code == 429 or "quota" in lower or "rate limit" in lower:
+        return "Gemini request limit reached temporarily. Please try again shortly."
+
+    if (
+        status_code == 503
+        or "high demand" in lower
+        or "experiencing high demand" in lower
+        or (status_code in (500, 502, 503) and "unavailable" in lower)
+    ):
         return (
-            "Gemini free-tier quota khatam ho gaya hai is model ke liye. "
-            ".env mein GEMINI_MODEL change karke server restart karein "
-            "(try: gemini-3.5-flash or gemini-3.6-flash)."
+            "Gemini is temporarily unavailable due to high demand. "
+            "Please try again shortly."
         )
+
+    if status_code == 500:
+        return "Gemini is temporarily unavailable. Please try again shortly."
+
     if "no longer available" in lower:
         return (
             "Yeh Gemini model ab available nahi hai. "
@@ -514,6 +780,7 @@ def call_gemini(contents, timing_started=None):
     """
     Call Gemini generateContent (non-streaming).
     Returns (text, None) on success, or (None, (response, status)) on failure.
+    Retries transient 429/500/503, timeouts, and network errors (max 3 attempts).
     """
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -522,49 +789,88 @@ def call_gemini(contents, timing_started=None):
     t0 = timing_started if timing_started is not None else time.perf_counter()
     _chat_timing("gemini_request_start", t0)
 
-    try:
-        resp = requests.post(
-            url, headers=_gemini_headers(), json=_gemini_payload(contents), timeout=60
+    last_error = None
+    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.post(
+                url,
+                headers=_gemini_headers(),
+                json=_gemini_payload(contents),
+                timeout=60,
+            )
+        except requests.Timeout:
+            _chat_timing("gemini_request_timeout", t0, attempt=attempt)
+            last_error = (jsonify({
+                "error": "Gemini took too long to respond. Please try again."
+            }), 504)
+            if attempt < GEMINI_MAX_ATTEMPTS:
+                _gemini_log_retry(attempt + 1, "timeout")
+                _gemini_retry_sleep(attempt)
+                continue
+            return None, last_error
+        except requests.RequestException:
+            _chat_timing("gemini_request_network_error", t0, attempt=attempt)
+            last_error = (jsonify({
+                "error": "Could not reach Gemini. Check your internet connection."
+            }), 502)
+            if attempt < GEMINI_MAX_ATTEMPTS:
+                _gemini_log_retry(attempt + 1, "network")
+                _gemini_retry_sleep(attempt)
+                continue
+            return None, last_error
+
+        _chat_timing(
+            "gemini_request_end",
+            t0,
+            http_status=resp.status_code,
+            attempt=attempt,
         )
-    except requests.Timeout:
-        _chat_timing("gemini_request_timeout", t0)
-        return None, (jsonify({
-            "error": "Gemini took too long to respond. Please try again."
-        }), 504)
-    except requests.RequestException:
-        _chat_timing("gemini_request_network_error", t0)
-        return None, (jsonify({
-            "error": "Could not reach Gemini. Check your internet connection."
-        }), 502)
 
-    _chat_timing("gemini_request_end", t0, http_status=resp.status_code)
+        try:
+            upstream = resp.json()
+        except ValueError:
+            last_error = (jsonify({
+                "error": "Received an invalid response from Gemini."
+            }), 502)
+            # Invalid JSON is usually not worth retrying like a 503, but a
+            # blank/truncated body on 5xx can be transient — only retry known codes.
+            if _gemini_is_retryable_status(resp.status_code) and attempt < GEMINI_MAX_ATTEMPTS:
+                _gemini_log_retry(attempt + 1, str(resp.status_code))
+                _gemini_retry_sleep(attempt)
+                continue
+            return None, last_error
 
-    try:
-        upstream = resp.json()
-    except ValueError:
-        return None, (jsonify({
-            "error": "Received an invalid response from Gemini."
-        }), 502)
+        if resp.ok:
+            text = extract_gemini_text(upstream)
+            if text:
+                text = text.strip()
+            if not text:
+                return None, (jsonify({
+                    "error": "Gemini returned an empty response. Please try again."
+                }), 502)
+            return text, None
 
-    if not resp.ok:
-        return None, (jsonify({
+        last_error = (jsonify({
             "error": _gemini_http_error_message(resp.status_code, upstream)
         }), 502)
+        if _gemini_is_retryable_status(resp.status_code) and attempt < GEMINI_MAX_ATTEMPTS:
+            _gemini_log_retry(attempt + 1, str(resp.status_code))
+            _gemini_retry_sleep(attempt)
+            continue
+        return None, last_error
 
-    text = extract_gemini_text(upstream)
-    if text:
-        text = text.strip()
-    if not text:
-        return None, (jsonify({
-            "error": "Gemini returned an empty response. Please try again."
-        }), 502)
-    return text, None
+    return None, last_error or (jsonify({
+        "error": "Gemini is temporarily unavailable. Please try again shortly."
+    }), 502)
 
 
 def iter_gemini_sse(contents, timing_started=None):
     """
     Stream Gemini tokens via streamGenerateContent?alt=sse.
     Yields ("delta", text_chunk) then ("done", full_text), or ("error", message).
+
+    Retries transient failures only before any delta is sent to the client.
+    Mid-stream failures are not restarted (avoids duplicate tokens).
     """
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -572,70 +878,125 @@ def iter_gemini_sse(contents, timing_started=None):
     )
     t0 = timing_started if timing_started is not None else time.perf_counter()
     _chat_timing("gemini_stream_start", t0)
-    first_token = True
-    pieces = []
 
+    stream_resp = None
     try:
-        with requests.post(
-            url,
-            headers=_gemini_headers(),
-            params={"alt": "sse"},
-            json=_gemini_payload(contents),
-            timeout=60,
-            stream=True,
-        ) as resp:
-            if not resp.ok:
-                try:
-                    upstream = resp.json()
-                except ValueError:
-                    upstream = {}
-                _chat_timing("gemini_stream_http_error", t0, http_status=resp.status_code)
-                yield ("error", _gemini_http_error_message(resp.status_code, upstream))
+        for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+            try:
+                stream_resp = requests.post(
+                    url,
+                    headers=_gemini_headers(),
+                    params={"alt": "sse"},
+                    json=_gemini_payload(contents),
+                    timeout=60,
+                    stream=True,
+                )
+            except requests.Timeout:
+                stream_resp = None
+                _chat_timing("gemini_stream_timeout", t0, attempt=attempt)
+                if attempt < GEMINI_MAX_ATTEMPTS:
+                    _gemini_log_retry(attempt + 1, "timeout")
+                    _gemini_retry_sleep(attempt)
+                    continue
+                yield ("error", "Gemini took too long to respond. Please try again.")
+                return
+            except requests.RequestException:
+                stream_resp = None
+                _chat_timing("gemini_stream_network_error", t0, attempt=attempt)
+                if attempt < GEMINI_MAX_ATTEMPTS:
+                    _gemini_log_retry(attempt + 1, "network")
+                    _gemini_retry_sleep(attempt)
+                    continue
+                yield (
+                    "error",
+                    "Could not reach Gemini. Check your internet connection.",
+                )
                 return
 
-            # Force UTF-8 so emoji/multibyte text is not decoded as Latin-1.
-            resp.encoding = "utf-8"
-            for raw_line in resp.iter_lines(decode_unicode=True):
-                if raw_line is None:
-                    continue
-                line = raw_line.strip()
-                if not line or line.startswith(":"):
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if not payload or payload == "[DONE]":
-                    continue
-                try:
-                    chunk = json.loads(payload)
-                except ValueError:
-                    continue
-                if isinstance(chunk, dict) and chunk.get("error"):
-                    yield ("error", _gemini_http_error_message(502, chunk))
-                    return
-                delta = extract_gemini_text(chunk)
-                if not delta:
-                    continue
-                if first_token:
-                    _chat_timing("gemini_stream_first_token", t0)
-                    first_token = False
-                pieces.append(delta)
-                yield ("delta", delta)
+            if stream_resp.ok:
+                break
+
+            try:
+                upstream = stream_resp.json()
+            except ValueError:
+                upstream = {}
+            status = stream_resp.status_code
+            _chat_timing(
+                "gemini_stream_http_error",
+                t0,
+                http_status=status,
+                attempt=attempt,
+            )
+            stream_resp.close()
+            stream_resp = None
+
+            if _gemini_is_retryable_status(status) and attempt < GEMINI_MAX_ATTEMPTS:
+                _gemini_log_retry(attempt + 1, str(status))
+                _gemini_retry_sleep(attempt)
+                continue
+
+            yield ("error", _gemini_http_error_message(status, upstream))
+            return
+        else:
+            yield (
+                "error",
+                "Gemini is temporarily unavailable due to high demand. "
+                "Please try again shortly.",
+            )
+            return
+
+        first_token = True
+        pieces = []
+        # Force UTF-8 so emoji/multibyte text is not decoded as Latin-1.
+        stream_resp.encoding = "utf-8"
+        for raw_line in stream_resp.iter_lines(decode_unicode=True):
+            if raw_line is None:
+                continue
+            line = raw_line.strip()
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload)
+            except ValueError:
+                continue
+            if isinstance(chunk, dict) and chunk.get("error"):
+                # Streaming already started (or about to); do not retry.
+                yield ("error", _gemini_http_error_message(502, chunk))
+                return
+            delta = extract_gemini_text(chunk)
+            if not delta:
+                continue
+            if first_token:
+                _chat_timing("gemini_stream_first_token", t0)
+                first_token = False
+            pieces.append(delta)
+            yield ("delta", delta)
+
+        full = "".join(pieces).strip()
+        _chat_timing("gemini_stream_end", t0, chars=len(full))
+        if not full:
+            yield ("error", "Gemini returned an empty response. Please try again.")
+            return
+        yield ("done", full)
     except requests.Timeout:
-        _chat_timing("gemini_stream_timeout", t0)
+        _chat_timing("gemini_stream_timeout", t0, phase="mid_stream")
         yield ("error", "Gemini took too long to respond. Please try again.")
         return
     except requests.RequestException:
-        _chat_timing("gemini_stream_network_error", t0)
+        _chat_timing("gemini_stream_network_error", t0, phase="mid_stream")
         yield ("error", "Could not reach Gemini. Check your internet connection.")
         return
-
-    full = "".join(pieces).strip()
-    _chat_timing("gemini_stream_end", t0, chars=len(full))
-    if not full:
-        yield ("error", "Gemini returned an empty response. Please try again.")
-        return
-    yield ("done", full)
+    finally:
+        if stream_resp is not None:
+            try:
+                stream_resp.close()
+            except Exception:
+                pass
 
 
 def _last_user_text(contents):
@@ -647,7 +1008,7 @@ def _last_user_text(contents):
 
 
 def _assert_conversation_owner(conversation_id, owner_id, timing_started=None):
-    """Optional ownership check. Returns (None, error_response) or (None, None)."""
+    """Optional ownership check. Returns error (response, status) or None."""
     if not conversation_id:
         return None
     t0 = timing_started if timing_started is not None else time.perf_counter()
@@ -660,8 +1021,23 @@ def _assert_conversation_owner(conversation_id, owner_id, timing_started=None):
         conversation = session.get(Conversation, conv_uuid)
         if conversation is not None and conversation.user_id != owner_id:
             return jsonify({"error": "Conversation not found."}), 404
+    except OperationalError:
+        # Stale/dropped Neon connections must not become unhandled HTML 500s.
+        app.logger.warning(
+            "Database OperationalError during conversation ownership check"
+        )
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        return jsonify({
+            "error": "Database connection temporarily unavailable. Please try again."
+        }), 503
     finally:
-        session.close()
+        try:
+            session.close()
+        except Exception:
+            pass
         if SessionLocal is not None:
             SessionLocal.remove()
     _chat_timing("db_owner_check_end", t0)
@@ -1509,6 +1885,12 @@ def chat():
         logout_user()
         return jsonify({"error": "Please log in to continue."}), 401
 
+    contents, attach_error = apply_current_turn_attachments(
+        contents, data.get("attachment_ids"), owner_id
+    )
+    if attach_error:
+        return attach_error
+
     owner_error = _assert_conversation_owner(
         data.get("conversation_id"), owner_id, timing_started=t0
     )
@@ -1575,6 +1957,12 @@ def chat_stream():
         message_count=len(contents),
         note="no_db_history_load_on_chat",
     )
+
+    contents, attach_error = apply_current_turn_attachments(
+        contents, data.get("attachment_ids"), owner_id
+    )
+    if attach_error:
+        return attach_error
 
     owner_error = _assert_conversation_owner(
         data.get("conversation_id"), owner_id, timing_started=t0
@@ -1836,6 +2224,101 @@ def edit_message():
     })
 
 
+@app.route("/api/attachments", methods=["POST"])
+@login_required
+def upload_attachments():
+    """Accept one or more user attachments into a per-user uploads folder."""
+    owner_id = session_owner_id()
+    if owner_id is None:
+        logout_user()
+        return jsonify({"error": "Please log in to continue."}), 401
+
+    files = request.files.getlist("files")
+    if not files:
+        single = request.files.get("file")
+        if single is not None:
+            files = [single]
+    files = [f for f in files if f and getattr(f, "filename", None)]
+    if not files:
+        return jsonify({"error": "No files were uploaded."}), 400
+    if len(files) > ATTACHMENT_MAX_FILES:
+        return jsonify({
+            "error": f"You can upload at most {ATTACHMENT_MAX_FILES} files at once."
+        }), 400
+
+    owner_dir = _owner_upload_dir(owner_id)
+    os.makedirs(owner_dir, exist_ok=True)
+    saved = []
+    try:
+        for upload in files:
+            original_name = (upload.filename or "").strip() or "attachment"
+            ext = _attachment_extension(original_name)
+            if ext not in ATTACHMENT_ALLOWED_EXTENSIONS:
+                raise ValueError(
+                    f'File type ".{ext or "?"}" is not allowed.'
+                    if ext else "File type is not allowed."
+                )
+
+            # Size check without loading the whole stream into a string.
+            upload.stream.seek(0, os.SEEK_END)
+            size = upload.stream.tell()
+            upload.stream.seek(0)
+            if size <= 0:
+                raise ValueError(f'"{original_name}" is empty.')
+            if size > ATTACHMENT_MAX_BYTES:
+                raise ValueError(
+                    f'"{original_name}" is too large. Max size is '
+                    f"{ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB."
+                )
+
+            safe = secure_filename(original_name) or f"attachment.{ext}"
+            file_id = uuid_mod.uuid4().hex
+            stored_name = f"{file_id}_{safe}"
+            path = os.path.join(owner_dir, stored_name)
+            upload.save(path)
+            saved.append({
+                "id": file_id,
+                "path": path,
+                "original_name": original_name[:255],
+                "extension": ext,
+                "content_type": (
+                    ATTACHMENT_MIME_BY_EXT.get(ext)
+                    or upload.mimetype
+                    or "application/octet-stream"
+                )[:120],
+                "size": size,
+            })
+    except ValueError as exc:
+        for item in saved:
+            try:
+                os.remove(item["path"])
+            except OSError:
+                pass
+        return jsonify({"error": str(exc)}), 400
+    except Exception:
+        app.logger.exception("Attachment upload failed")
+        for item in saved:
+            try:
+                os.remove(item["path"])
+            except OSError:
+                pass
+        return jsonify({"error": "Could not save attachments. Please try again."}), 500
+
+    return jsonify({
+        "ok": True,
+        "attachments": [
+            {
+                "id": item["id"],
+                "name": item["original_name"],
+                "extension": item["extension"],
+                "content_type": item["content_type"],
+                "size": item["size"],
+            }
+            for item in saved
+        ],
+    })
+
+
 @app.route("/api/tts", methods=["POST"])
 @login_required
 def text_to_speech():
@@ -1907,6 +2390,235 @@ def text_to_speech():
 
     return Response(audio, mimetype=content_type, headers={
         "Cache-Control": "no-store",
+    })
+
+
+def _extract_generated_image(resp_json):
+    """Pull the first image blob from a Gemini image-generation response."""
+    if not isinstance(resp_json, dict):
+        return None, None
+
+    try:
+        # Interactions API: top-level output_image
+        output_image = resp_json.get("output_image")
+        if isinstance(output_image, dict) and output_image.get("data"):
+            mime = output_image.get("mime_type") or output_image.get("mimeType") or "image/png"
+            return str(mime)[:120], output_image.get("data")
+
+        # Interactions API: steps[].content[] with type "image"
+        for step in resp_json.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            content_items = step.get("content") or []
+            if isinstance(content_items, dict):
+                content_items = [content_items]
+            for item in content_items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "image" and item.get("data"):
+                    mime = item.get("mime_type") or item.get("mimeType") or "image/png"
+                    return str(mime)[:120], item.get("data")
+                inline = item.get("inline_data") or item.get("inlineData")
+                if isinstance(inline, dict) and inline.get("data"):
+                    mime = (
+                        inline.get("mime_type")
+                        or inline.get("mimeType")
+                        or "image/png"
+                    )
+                    return str(mime)[:120], inline.get("data")
+
+        # Legacy generateContent-style candidates[].content.parts[].inline_data
+        candidates = resp_json.get("candidates") or []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content") or {}
+            parts = content.get("parts") or []
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                inline = part.get("inline_data") or part.get("inlineData")
+                if not isinstance(inline, dict):
+                    continue
+                data = inline.get("data")
+                if not data:
+                    continue
+                mime = (
+                    inline.get("mime_type")
+                    or inline.get("mimeType")
+                    or "image/png"
+                )
+                return str(mime)[:120], data
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return None, None
+    return None, None
+
+
+def _image_generation_error_message(status_code, upstream):
+    """
+    User-facing errors for /api/image-generation only.
+    Never suggests changing GEMINI_MODEL (chat model).
+    """
+    message = None
+    if isinstance(upstream, dict):
+        err = upstream.get("error")
+        if isinstance(err, dict):
+            message = err.get("message")
+        elif isinstance(err, str):
+            message = err
+        if not message:
+            message = upstream.get("message")
+    friendly = (message or "").strip()
+    lower = friendly.lower()
+    status = int(status_code or 0)
+
+    if status == 401:
+        return (
+            "Image generation authentication failed. "
+            "Check the Gemini API key on the server."
+        )
+    if status == 403:
+        return (
+            "Image generation is not allowed for this Gemini API project. "
+            "Enable image-generation access or billing for this project."
+        )
+    if (
+        status == 404
+        or "not found" in lower
+        or "is not found" in lower
+        or "not supported" in lower
+        or "unknown model" in lower
+    ):
+        return (
+            "The configured Gemini image-generation model is not available "
+            "for this API project."
+        )
+    if (
+        status == 429
+        or "quota" in lower
+        or "rate limit" in lower
+        or "resource_exhausted" in lower
+        or "billing" in lower
+        or "free tier" in lower
+        or "free_tier" in lower
+    ):
+        return (
+            "Image generation is not available on the current Gemini API plan. "
+            "Please enable billing or use an image-generation model/plan with access."
+        )
+    if status == 400:
+        if friendly and "gemini_model" not in lower:
+            return friendly[:300]
+        return "Invalid image-generation request. Please try a different prompt."
+    if status in (500, 502, 503) or "unavailable" in lower:
+        return "Image generation is temporarily unavailable. Please try again shortly."
+    if friendly and "gemini_model" not in lower:
+        return friendly[:400]
+    return f"Image generation failed (HTTP {status_code})."
+
+
+def _image_generation_http_status(upstream_status):
+    """Map upstream Gemini status to a safe API status for the frontend."""
+    status = int(upstream_status or 0)
+    if status in (400, 401, 403, 429):
+        return status
+    if status == 404:
+        return 502
+    if status == 503:
+        return 503
+    return 502
+
+
+@app.route("/api/image-generation", methods=["POST"])
+@login_required
+def image_generation():
+    """Generate an image from a text prompt via a dedicated Gemini image model."""
+    if not IMAGE_GENERATION_ENABLED:
+        return jsonify({
+            "ok": False,
+            "error": "Image generation is temporarily unavailable.",
+        }), 503
+
+    if not API_KEY:
+        return jsonify({
+            "ok": False,
+            "error": "Image generation is not configured on the server.",
+        }), 500
+
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt")
+    if prompt is None or not str(prompt).strip():
+        return jsonify({
+            "ok": False,
+            "error": "Request must include a non-empty image prompt.",
+        }), 400
+
+    prompt = str(prompt).strip()
+    if len(prompt) > IMAGE_PROMPT_MAX_CHARS:
+        return jsonify({
+            "ok": False,
+            "error": "Image prompt is too long. Please shorten it a bit.",
+        }), 400
+
+    # Dedicated Interactions API for image models (does not use GEMINI_MODEL chat).
+    url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    headers = dict(_gemini_headers())
+    headers["Api-Revision"] = "2026-05-20"
+    payload = {
+        "model": GEMINI_IMAGE_MODEL,
+        "input": prompt,
+        "response_format": {
+            "type": "image",
+            "image_size": "1K",
+            "delivery": "inline",
+        },
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=90,
+        )
+    except requests.Timeout:
+        return jsonify({
+            "ok": False,
+            "error": "Image generation took too long. Please try again.",
+        }), 504
+    except requests.RequestException:
+        return jsonify({
+            "ok": False,
+            "error": "Could not reach the image generation service.",
+        }), 502
+
+    try:
+        upstream = resp.json()
+    except ValueError:
+        return jsonify({
+            "ok": False,
+            "error": "Received an invalid response from image generation.",
+        }), 502
+
+    if not resp.ok:
+        return jsonify({
+            "ok": False,
+            "error": _image_generation_error_message(resp.status_code, upstream),
+        }), _image_generation_http_status(resp.status_code)
+
+    mime_type, image_data = _extract_generated_image(upstream)
+    if not image_data:
+        return jsonify({
+            "ok": False,
+            "error": "Image generation did not return an image. Please try a clearer prompt.",
+        }), 502
+
+    return jsonify({
+        "ok": True,
+        "image": {
+            "mime_type": mime_type or "image/png",
+            "data": image_data,
+        },
     })
 
 
